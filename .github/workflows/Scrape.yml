@@ -42,7 +42,7 @@ jobs:
           MART_EMAIL:    ${{ secrets.MART_EMAIL }}
           MART_PASSWORD: ${{ secrets.MART_PASSWORD }}
           MART_HOST:     ${{ secrets.MART_HOST }}
-        run: python Scraper/scraper.py
+        run: python Scraper/Scraper.py
 
       - name: Commit & push new data file
         run: |
