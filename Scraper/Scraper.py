@@ -101,29 +101,91 @@ def parse_dashboard_date(text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _dump_debug(page, label: str) -> None:
+    """Save the current page HTML + screenshot for post-mortem debugging."""
+    debug_dir = Path(__file__).resolve().parent / "debug"
+    debug_dir.mkdir(exist_ok=True)
+    try:
+        (debug_dir / f"{label}.html").write_text(page.content(), encoding="utf-8")
+    except Exception as e:
+        print(f"[debug] failed to dump html: {e}", file=sys.stderr)
+    try:
+        page.screenshot(path=str(debug_dir / f"{label}.png"), full_page=True)
+    except Exception as e:
+        print(f"[debug] failed to screenshot: {e}", file=sys.stderr)
+
+    # Also log to stdout so you can see it in the Actions log directly.
+    try:
+        url = page.url
+        title = page.title()
+        print(f"[debug] url   = {url}", file=sys.stderr)
+        print(f"[debug] title = {title!r}", file=sys.stderr)
+        inputs = page.evaluate(
+            "() => Array.from(document.querySelectorAll('input,iframe')).map(el => ({"
+            "tag: el.tagName.toLowerCase(),"
+            "type: el.getAttribute('type'),"
+            "name: el.getAttribute('name'),"
+            "id:   el.id || null,"
+            "cls:  el.getAttribute('class'),"
+            "placeholder: el.getAttribute('placeholder'),"
+            "src:  el.getAttribute('src'),"
+            "}))"
+        )
+        print(f"[debug] inputs+iframes ({len(inputs)}):", file=sys.stderr)
+        for el in inputs:
+            print(f"  {el}", file=sys.stderr)
+    except Exception as e:
+        print(f"[debug] failed to enumerate inputs: {e}", file=sys.stderr)
+
+
 def login(page, login_url: str, email: str, password: str) -> None:
     """Sign in to the Mart seller portal."""
-    page.goto(login_url, wait_until="domcontentloaded", timeout=60_000)
+    # Try the deep login URL first (skips a redirect hop).
+    deep_login_url = login_url.rstrip("/") + "/apps/seller/login"
+    page.goto(deep_login_url, wait_until="domcontentloaded", timeout=60_000)
+    # Give the SPA a moment to mount its form even after DOMContentLoaded.
+    page.wait_for_timeout(2_500)
 
     # The portal usually uses name="account" for the email/phone field, but
-    # the markup has changed before -- try a few likely selectors.
+    # the markup has changed before -- try a wide net of likely selectors.
     email_selectors = [
         'input[name="account"]',
+        'input[id="account"]',
+        'input[name="username"]',
+        'input[name="email"]',
+        'input[name="loginName"]',
         'input[type="email"]',
         'input[placeholder*="mail" i]',
         'input[placeholder*="account" i]',
         'input[placeholder*="phone" i]',
+        'input[placeholder*="member" i]',
+        'input.next-input',                # Ant/Next design
+        'form input[type="text"]',
         'input[type="text"]',
     ]
     email_input = None
     for sel in email_selectors:
         try:
-            page.wait_for_selector(sel, timeout=5_000, state="visible")
+            page.wait_for_selector(sel, timeout=4_000, state="visible")
             email_input = page.locator(sel).first
             break
         except PWTimeout:
             continue
     if email_input is None:
+        # Maybe the form is inside an iframe (Daraz wraps some flows that way).
+        for frame in page.frames:
+            try:
+                for sel in email_selectors:
+                    if frame.locator(sel).count():
+                        email_input = frame.locator(sel).first
+                        print(f"[debug] found email input inside iframe url={frame.url}", file=sys.stderr)
+                        break
+                if email_input is not None:
+                    break
+            except Exception:
+                continue
+    if email_input is None:
+        _dump_debug(page, "login-failure")
         raise RuntimeError("Could not locate the email/account input on the login page.")
 
     email_input.fill(email)
