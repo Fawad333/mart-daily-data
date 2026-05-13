@@ -222,7 +222,7 @@ def collect_metrics(page, dashboard_url: str) -> tuple[dict, str | None]:
 def main() -> int:
     email = os.environ.get("MART_EMAIL")
     password = os.environ.get("MART_PASSWORD")
-    host = os.environ.get("MART_HOST")
+    host = (os.environ.get("MART_HOST") or "").strip()
     if not email or not password or not host:
         print(
             "ERROR: MART_EMAIL, MART_PASSWORD and MART_HOST environment "
@@ -230,6 +230,10 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    # Be forgiving: accept "sellercenter.example", "https://sellercenter.example",
+    # or "https://sellercenter.example/" all as the same hostname.
+    host = re.sub(r"^https?://", "", host, flags=re.IGNORECASE).strip("/")
 
     login_url = f"https://{host}/"
     dashboard_url = f"https://{host}/ba/dashboard"
