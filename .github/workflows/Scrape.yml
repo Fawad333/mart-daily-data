@@ -1,14 +1,13 @@
+```yaml id="kklz3j"
 name: Mart daily scrape
 
 on:
   schedule:
-    # 5:00 AM Pakistan time (UTC+5) == 00:00 UTC
+    # 5:00 AM Pakistan time (UTC+5)
     - cron: '0 0 * * *'
-  # Manual run from the Actions tab -- useful for testing and re-runs.
+
   workflow_dispatch:
 
-# Only one scrape at a time -- if a long run overlaps the next schedule
-# we just skip the newer one rather than racing two browsers.
 concurrency:
   group: mart-scrape
   cancel-in-progress: false
@@ -16,63 +15,95 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+
+    timeout-minutes: 25
+
     permissions:
-      contents: write  # needed so we can git push the new JSON back
+      contents: write
 
     steps:
-      - name: Checkout
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      # (Cloudflare WARP step removed -- WARP DNS couldn't resolve the
-      # target host. Re-introduce it later with a DNS override if we still
-      # need to mask the runner IP.)
-
-      - name: Show outbound IP (for debugging)
+      - name: Show runner network info
         run: |
-          echo "outbound IPv4: $(curl -s --max-time 10 https://api.ipify.org || echo unknown)"
-          echo "outbound geo : $(curl -s --max-time 10 https://ipinfo.io | head -c 400 || echo unknown)"
+          echo "========== PUBLIC IP =========="
+          curl -s --max-time 20 https://api.ipify.org || true
+          echo
 
-      - name: Install Python deps
+          echo "========== IP INFO =========="
+          curl -s --max-time 20 https://ipinfo.io || true
+          echo
+
+          echo "========== DNS TEST =========="
+          nslookup sellercenter.daraz.pk || true
+          echo
+
+      - name: Upgrade pip
         run: |
           python -m pip install --upgrade pip
-          pip install 'patchright>=1.49.0' 'playwright-stealth==1.0.6'
 
-      - name: Install Chromium for Patchright
+      - name: Install Python dependencies
         run: |
-          # Patchright bundles its own patched Chromium download command.
-          python -m patchright install --with-deps chromium
+          pip install requests
+          pip install patchright>=1.49.0
+          pip install playwright-stealth==1.0.6
+
+      - name: Install Chromium
+        run: |
+          python -m patchright install chromium
+
+      - name: Verify installations
+        run: |
+          python -c "import requests; print('requests OK')"
+          python -c "import patchright; print('patchright OK')"
+          python -c "import playwright_stealth; print('stealth OK')"
+
+      - name: Create required folders
+        run: |
+          mkdir -p Scraper/debug
+          mkdir -p Scraper/data
 
       - name: Run scraper
         env:
-          MART_EMAIL:    ${{ secrets.MART_EMAIL }}
+          MART_EMAIL: ${{ secrets.MART_EMAIL }}
           MART_PASSWORD: ${{ secrets.MART_PASSWORD }}
-          MART_HOST:     ${{ secrets.MART_HOST }}
-          MART_COOKIES:  ${{ secrets.MART_COOKIES }}
-          MART_PROXY:    ${{ secrets.MART_PROXY }}
-        run: python Scraper/Scraper.py
+          MART_HOST: ${{ secrets.MART_HOST }}
+          MART_COOKIES: ${{ secrets.MART_COOKIES }}
+          MART_PROXY: ${{ secrets.MART_PROXY }}
 
-      - name: Upload debug snapshot on failure
+        run: |
+          python Scraper/Scraper.py
+
+      - name: Upload debug artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: scraper-debug
-          path: Scraper/debug/
+          path: |
+            Scraper/debug/
+            Scraper/data/
           if-no-files-found: ignore
+          retention-days: 7
 
-      - name: Commit & push new data file
+      - name: Commit scraped data
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add Scraper/data/
+
           if git diff --cached --quiet; then
-            echo "No new data to commit."
+            echo "No changes detected."
           else
             git commit -m "data: scrape $(TZ=Asia/Karachi date +%F) [skip ci]"
             git push
           fi
+```
