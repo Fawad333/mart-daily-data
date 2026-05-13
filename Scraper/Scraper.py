@@ -134,10 +134,13 @@ def _dump_debug(page, label: str) -> None:
     debug_dir.mkdir(exist_ok=True)
     try:
         (debug_dir / f"{label}.html").write_text(page.content(), encoding="utf-8")
+        print(f"[debug] wrote debug/{label}.html", file=sys.stderr)
     except Exception as e:
         print(f"[debug] failed to dump html: {e}", file=sys.stderr)
     try:
-        page.screenshot(path=str(debug_dir / f"{label}.png"), full_page=True)
+        # full_page=False (viewport only) is more reliable on headless CI.
+        page.screenshot(path=str(debug_dir / f"{label}.png"), full_page=False)
+        print(f"[debug] wrote debug/{label}.png", file=sys.stderr)
     except Exception as e:
         print(f"[debug] failed to screenshot: {e}", file=sys.stderr)
 
@@ -172,8 +175,29 @@ def login(page, login_url: str, email: str, password: str) -> None:
     # Try the deep login URL first (skips a redirect hop).
     deep_login_url = login_url.rstrip("/") + "/apps/seller/login"
     page.goto(deep_login_url, wait_until="domcontentloaded", timeout=60_000)
-    # Give the SPA a moment to mount its form even after DOMContentLoaded.
-    page.wait_for_timeout(2_500)
+
+    # The portal is a SPA -- DOMContentLoaded fires long before the form
+    # mounts. Wait for network to settle, then grab a snapshot regardless
+    # so we can see the booting page in the artifact.
+    try:
+        page.wait_for_load_state("networkidle", timeout=30_000)
+        print(f"[mart] networkidle reached at {page.url}", file=sys.stderr)
+    except PWTimeout:
+        print(f"[mart] networkidle wait timed out at {page.url}; continuing",
+              file=sys.stderr)
+
+    page.wait_for_timeout(5_000)
+    _dump_debug(page, "pre-login")
+
+    # Wait for the form to actually mount (any input is fine).
+    for attempt in range(4):
+        try:
+            page.wait_for_selector("input", timeout=10_000, state="attached")
+            break
+        except PWTimeout:
+            print(f"[mart] no <input> yet (attempt {attempt + 1}); waiting another 5s",
+                  file=sys.stderr)
+            page.wait_for_timeout(5_000)
 
     # The portal sometimes redirects new sessions to a register page that
     # has a "Sign In" / "Login" link to swap to the real login form.
