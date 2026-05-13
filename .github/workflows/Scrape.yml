@@ -29,13 +29,27 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Tunnel outbound traffic through Cloudflare WARP so the runner does
+      # not present itself with a known Azure datacenter IP. Free. Some
+      # anti-bot stacks block known datacenter IPs but accept WARP.
+      - name: Route runner through Cloudflare WARP
+        uses: Boostport/setup-cloudflare-warp@v1
+        continue-on-error: true  # if WARP setup fails, still try direct
+
+      - name: Show outbound IP (for debugging)
+        run: |
+          echo "outbound IPv4: $(curl -s --max-time 10 https://api.ipify.org || echo unknown)"
+          echo "outbound geo : $(curl -s --max-time 10 https://ipinfo.io | head -c 400 || echo unknown)"
+
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install playwright==1.45.0 playwright-stealth==1.0.6
+          pip install 'patchright>=1.49.0' 'playwright-stealth==1.0.6'
 
-      - name: Install Chromium for Playwright
-        run: python -m playwright install --with-deps chromium
+      - name: Install Chromium for Patchright
+        run: |
+          # Patchright bundles its own patched Chromium download command.
+          python -m patchright install --with-deps chromium
 
       - name: Run scraper
         env:
