@@ -44,6 +44,14 @@ jobs:
           MART_HOST:     ${{ secrets.MART_HOST }}
         run: python Scraper/Scraper.py
 
+      - name: Upload debug snapshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-debug
+          path: Scraper/debug/
+          if-no-files-found: ignore
+
       - name: Commit & push new data file
         run: |
           git config user.name  "github-actions[bot]"
