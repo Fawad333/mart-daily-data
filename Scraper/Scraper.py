@@ -24,12 +24,23 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from playwright.sync_api import TimeoutError as PWTimeout
-from playwright.sync_api import sync_playwright
+# Patchright is a maintained fork of Playwright with patches that close
+# the residual CDP / runtime-detection leaks that vanilla Playwright +
+# playwright-stealth can't reach. Same API -- drop-in replacement.
+# Fall back to vanilla Playwright if patchright isn't installed.
+_USING_PATCHRIGHT = False
+try:
+    from patchright.sync_api import TimeoutError as PWTimeout  # type: ignore
+    from patchright.sync_api import sync_playwright  # type: ignore
+    _USING_PATCHRIGHT = True
+except ImportError:
+    from playwright.sync_api import TimeoutError as PWTimeout
+    from playwright.sync_api import sync_playwright
 
 # playwright-stealth masks the most common bot-detection signals
-# (navigator.webdriver, plugins, languages, WebGL vendor, etc.).
-# Optional import so the script still runs if the lib is missing.
+# (navigator.webdriver, plugins, languages, WebGL vendor, etc.). Patchright
+# already does most of this natively, but we layer stealth on top as a
+# belt-and-braces measure when running with vanilla Playwright.
 try:
     from playwright_stealth import Stealth as _StealthClass  # type: ignore
 
@@ -51,8 +62,11 @@ except ImportError:
                 print(f"[stealth] apply failed: {e}", file=sys.stderr)
     except ImportError:
         def apply_stealth(page) -> None:
-            print("[stealth] playwright-stealth not installed; skipping.",
-                  file=sys.stderr)
+            # patchright handles most of this natively; only log if we're
+            # actually relying on vanilla Playwright.
+            if not _USING_PATCHRIGHT:
+                print("[stealth] playwright-stealth not installed; skipping.",
+                      file=sys.stderr)
 
 # Pakistan Standard Time (UTC+5, no DST).
 PKT = timezone(timedelta(hours=5))
@@ -418,6 +432,9 @@ def main() -> int:
                     "password": p,
                 }
         print(f"[mart] using proxy {proxy.get('server')}")
+
+    print(f"[mart] using {'patchright' if _USING_PATCHRIGHT else 'playwright'}",
+          file=sys.stderr)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
