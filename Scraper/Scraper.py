@@ -27,6 +27,33 @@ from pathlib import Path
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
+# playwright-stealth masks the most common bot-detection signals
+# (navigator.webdriver, plugins, languages, WebGL vendor, etc.).
+# Optional import so the script still runs if the lib is missing.
+try:
+    from playwright_stealth import Stealth as _StealthClass  # type: ignore
+
+    _stealth_instance = _StealthClass()
+
+    def apply_stealth(page) -> None:
+        try:
+            _stealth_instance.apply_stealth_sync(page)
+        except Exception as e:
+            print(f"[stealth] apply failed: {e}", file=sys.stderr)
+except ImportError:
+    try:
+        from playwright_stealth import stealth_sync as _stealth_sync  # type: ignore
+
+        def apply_stealth(page) -> None:
+            try:
+                _stealth_sync(page)
+            except Exception as e:
+                print(f"[stealth] apply failed: {e}", file=sys.stderr)
+    except ImportError:
+        def apply_stealth(page) -> None:
+            print("[stealth] playwright-stealth not installed; skipping.",
+                  file=sys.stderr)
+
 # Pakistan Standard Time (UTC+5, no DST).
 PKT = timezone(timedelta(hours=5))
 
@@ -120,19 +147,21 @@ def _dump_debug(page, label: str) -> None:
         title = page.title()
         print(f"[debug] url   = {url}", file=sys.stderr)
         print(f"[debug] title = {title!r}", file=sys.stderr)
-        inputs = page.evaluate(
-            "() => Array.from(document.querySelectorAll('input,iframe')).map(el => ({"
+        nodes = page.evaluate(
+            "() => Array.from(document.querySelectorAll('input,iframe,a,button')).map(el => ({"
             "tag: el.tagName.toLowerCase(),"
             "type: el.getAttribute('type'),"
             "name: el.getAttribute('name'),"
             "id:   el.id || null,"
             "cls:  el.getAttribute('class'),"
             "placeholder: el.getAttribute('placeholder'),"
+            "href: el.getAttribute('href'),"
             "src:  el.getAttribute('src'),"
+            "text: (el.innerText || '').slice(0, 60).trim(),"
             "}))"
         )
-        print(f"[debug] inputs+iframes ({len(inputs)}):", file=sys.stderr)
-        for el in inputs:
+        print(f"[debug] inputs+iframes+anchors+buttons ({len(nodes)}):", file=sys.stderr)
+        for el in nodes:
             print(f"  {el}", file=sys.stderr)
     except Exception as e:
         print(f"[debug] failed to enumerate inputs: {e}", file=sys.stderr)
@@ -145,6 +174,31 @@ def login(page, login_url: str, email: str, password: str) -> None:
     page.goto(deep_login_url, wait_until="domcontentloaded", timeout=60_000)
     # Give the SPA a moment to mount its form even after DOMContentLoaded.
     page.wait_for_timeout(2_500)
+
+    # The portal sometimes redirects new sessions to a register page that
+    # has a "Sign In" / "Login" link to swap to the real login form.
+    current_url = (page.url or "").lower()
+    if "register" in current_url or "signup" in current_url:
+        print(f"[mart] landed on {page.url} -- looking for a Login link...", file=sys.stderr)
+        login_link_selectors = [
+            'a:has-text("Login")',
+            'a:has-text("Sign In")',
+            'a:has-text("Sign in")',
+            'button:has-text("Login")',
+            'button:has-text("Sign In")',
+            'a[href*="login" i]:not([href*="register" i])',
+        ]
+        for sel in login_link_selectors:
+            loc = page.locator(sel).first
+            if loc.count():
+                try:
+                    loc.click(timeout=3_000)
+                    page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                    page.wait_for_timeout(1_500)
+                    print(f"[mart] clicked Login link via '{sel}' -> {page.url}", file=sys.stderr)
+                    break
+                except Exception:
+                    continue
 
     # The portal usually uses name="account" for the email/phone field, but
     # the markup has changed before -- try a wide net of likely selectors.
@@ -172,7 +226,7 @@ def login(page, login_url: str, email: str, password: str) -> None:
         except PWTimeout:
             continue
     if email_input is None:
-        # Maybe the form is inside an iframe (Daraz wraps some flows that way).
+        # Maybe the form is inside an iframe (the portal wraps some flows that way).
         for frame in page.frames:
             try:
                 for sel in email_selectors:
@@ -217,6 +271,16 @@ def login(page, login_url: str, email: str, password: str) -> None:
 def collect_metrics(page, dashboard_url: str) -> tuple[dict, str | None]:
     """Navigate to the BA dashboard and scrape the Key Metrics panel."""
     page.goto(dashboard_url, wait_until="domcontentloaded", timeout=60_000)
+
+    # If we land on a login/register page instead of the dashboard, the
+    # cookies have expired (or were never valid).
+    current = (page.url or "").lower()
+    if "login" in current or "register" in current or "signin" in current:
+        _dump_debug(page, "dashboard-redirect")
+        raise RuntimeError(
+            f"Dashboard redirected to {page.url} -- session cookies expired or invalid. "
+            "Re-export MART_COOKIES from a fresh logged-in browser session."
+        )
 
     # Wait for at least one metric card to mount.
     page.wait_for_selector(".D3c3eK .A5EvH0", timeout=60_000)
@@ -285,10 +349,18 @@ def main() -> int:
     email = os.environ.get("MART_EMAIL")
     password = os.environ.get("MART_PASSWORD")
     host = (os.environ.get("MART_HOST") or "").strip()
-    if not email or not password or not host:
+    cookies_raw = (os.environ.get("MART_COOKIES") or "").strip()
+
+    if not host:
+        print("ERROR: MART_HOST environment variable is required.", file=sys.stderr)
+        return 1
+
+    # Either cookies OR email+password must be supplied. Cookies are strongly
+    # preferred because the portal blocks form login from cloud IPs.
+    if not cookies_raw and (not email or not password):
         print(
-            "ERROR: MART_EMAIL, MART_PASSWORD and MART_HOST environment "
-            "variables are required.",
+            "ERROR: provide MART_COOKIES (preferred), or MART_EMAIL and "
+            "MART_PASSWORD as a fallback.",
             file=sys.stderr,
         )
         return 1
@@ -304,28 +376,103 @@ def main() -> int:
     data_dir = repo_root / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    proxy_url = (os.environ.get("MART_PROXY") or "").strip()
+    proxy = None
+    if proxy_url:
+        # Support either "host:port" or full URL with creds:
+        #   "http://user:pass@host:port"
+        proxy = {"server": proxy_url}
+        if "@" in proxy_url:
+            scheme_split = proxy_url.split("://", 1)
+            tail = scheme_split[-1]
+            creds, server = tail.split("@", 1)
+            if ":" in creds:
+                u, p = creds.split(":", 1)
+                proxy = {
+                    "server": f"{scheme_split[0]}://{server}" if "://" in proxy_url else server,
+                    "username": u,
+                    "password": p,
+                }
+        print(f"[mart] using proxy {proxy.get('server')}")
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=True,
+            proxy=proxy,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-features=IsolateOrigins,site-per-process",
             ],
         )
+        # Mimic a real desktop Chrome on Windows -- the same fingerprint
+        # most real sellers actually use.
         context = browser.new_context(
-            viewport={"width": 1440, "height": 900},
+            viewport={"width": 1366, "height": 768},
             user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
             ),
             locale="en-US",
+            timezone_id="Asia/Karachi",
+            color_scheme="light",
+            device_scale_factor=1,
+            has_touch=False,
+            is_mobile=False,
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,*/*;q=0.8"
+                ),
+                "sec-ch-ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            },
         )
+        # Preload session cookies if provided -- avoids the login flow entirely.
+        if cookies_raw:
+            try:
+                cookies = json.loads(cookies_raw)
+                # Normalise common cookie-editor export shapes so Playwright
+                # accepts them. Playwright wants: name, value, and either
+                # (domain + path) OR url. It also wants sameSite in
+                # {"Strict", "Lax", "None"} or omitted.
+                clean: list[dict] = []
+                for c in cookies:
+                    cc = {k: v for k, v in c.items() if k in (
+                        "name", "value", "domain", "path", "expires",
+                        "httpOnly", "secure", "sameSite",
+                    )}
+                    if "sameSite" in cc:
+                        s = str(cc["sameSite"]).lower()
+                        cc["sameSite"] = {
+                            "strict": "Strict", "lax": "Lax", "no_restriction": "None",
+                            "none": "None", "unspecified": "Lax",
+                        }.get(s, "Lax")
+                    if "expires" in cc and (cc["expires"] is None or cc["expires"] == ""):
+                        cc.pop("expires")
+                    if "domain" not in cc and "url" in c:
+                        cc["url"] = c["url"]
+                    clean.append(cc)
+                context.add_cookies(clean)
+                print(f"[mart] loaded {len(clean)} cookies; skipping login.")
+            except Exception as e:
+                print(f"ERROR: MART_COOKIES is not valid JSON or is malformed: {e}",
+                      file=sys.stderr)
+                context.close()
+                browser.close()
+                return 1
+
         page = context.new_page()
+        apply_stealth(page)
         try:
-            print("[mart] logging in...")
-            login(page, login_url, email, password)
-            print("[mart] login OK, collecting Business Advisor metrics...")
+            if not cookies_raw:
+                print("[mart] logging in via email+password...")
+                login(page, login_url, email, password)
+            print("[mart] collecting Business Advisor metrics...")
             metrics, dashboard_date = collect_metrics(page, dashboard_url)
         finally:
             context.close()
