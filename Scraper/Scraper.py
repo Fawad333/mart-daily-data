@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -11,18 +12,61 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
-from patchright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
+
+# =========================
+# PATCHRIGHT / PLAYWRIGHT
+# =========================
+
+_USING_PATCHRIGHT = False
+
+try:
+    from patchright.sync_api import sync_playwright
+    from patchright.sync_api import TimeoutError as PWTimeout
+
+    _USING_PATCHRIGHT = True
+
+except ImportError:
+    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+# =========================
+# STEALTH
+# =========================
+
+try:
+    from playwright_stealth import stealth_sync
+
+    def apply_stealth(page):
+        try:
+            stealth_sync(page)
+        except Exception as e:
+            print(f"[stealth] failed: {e}", file=sys.stderr)
+
+except Exception:
+
+    def apply_stealth(page):
+        pass
+
+# =========================
+# CONFIG
+# =========================
 
 PKT = timezone(timedelta(hours=5))
 
 PROXY_SOURCES = [
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
 ]
 
-TEST_URL = "https://httpbin.org/ip"
+TARGET_TEST_URL = "https://sellercenter.daraz.pk/"
+
+LOGIN_URL = "https://sellercenter.daraz.pk/apps/seller/login"
+
+DASHBOARD_URL = "https://sellercenter.daraz.pk/ba/dashboard"
+
+# =========================
+# HELPERS
+# =========================
 
 
 def log(msg: str):
@@ -30,28 +74,85 @@ def log(msg: str):
 
 
 def yesterday_pkt_str():
-    return (datetime.now(PKT) - timedelta(days=1)).strftime("%Y-%m-%d")
+    return (
+        datetime.now(PKT) - timedelta(days=1)
+    ).strftime("%Y-%m-%d")
 
 
 def validate_host(host: str):
+
     try:
         ip = socket.gethostbyname(host)
+
         log(f"[dns] {host} -> {ip}")
+
     except Exception as e:
-        raise RuntimeError(f"DNS failed for {host}: {e}")
+
+        raise RuntimeError(
+            f"DNS resolution failed for {host}: {e}"
+        )
+
+
+# =========================
+# DEBUG DUMP
+# =========================
+
+
+def dump_debug(page, label: str):
+
+    debug_dir = Path(__file__).resolve().parent / "debug"
+
+    debug_dir.mkdir(exist_ok=True)
+
+    try:
+        page.screenshot(
+            path=str(debug_dir / f"{label}.png"),
+            full_page=True,
+        )
+
+        log(f"[debug] screenshot: {label}.png")
+
+    except Exception as e:
+        log(f"[debug] screenshot failed: {e}")
+
+    try:
+        html = page.content()
+
+        (debug_dir / f"{label}.html").write_text(
+            html,
+            encoding="utf-8",
+        )
+
+        log(f"[debug] html: {label}.html")
+
+    except Exception as e:
+        log(f"[debug] html dump failed: {e}")
+
+
+# =========================
+# PROXY SYSTEM
+# =========================
 
 
 def download_proxy_lists():
+
     proxies = set()
 
     for url in PROXY_SOURCES:
+
         try:
+
             log(f"[proxy] downloading {url}")
 
-            r = requests.get(url, timeout=20)
+            r = requests.get(
+                url,
+                timeout=20,
+            )
 
             if r.ok:
+
                 for line in r.text.splitlines():
+
                     line = line.strip()
 
                     if not line:
@@ -60,120 +161,151 @@ def download_proxy_lists():
                     if ":" not in line:
                         continue
 
+                    if line.startswith("#"):
+                        continue
+
                     proxies.add(line)
 
         except Exception as e:
-            log(f"[proxy] failed source {url}: {e}")
+
+            log(f"[proxy] source failed: {e}")
 
     return list(proxies)
 
 
-def build_proxy_candidates(raw_proxies):
-    out = []
+def normalize_proxy(proxy: str):
 
-    for p in raw_proxies:
+    if proxy.startswith("http://"):
+        return proxy
 
-        if p.startswith("http://") or p.startswith("https://"):
-            out.append(p)
-            continue
+    if proxy.startswith("https://"):
+        return proxy
 
-        if p.startswith("socks5://"):
-            out.append(p)
-            continue
+    if proxy.startswith("socks5://"):
+        return proxy
 
-        out.append(f"http://{p}")
-        out.append(f"socks5://{p}")
-
-    random.shuffle(out)
-
-    return out
+    return f"http://{proxy}"
 
 
-def test_proxy(proxy_url):
+def test_proxy(proxy_url: str):
+
+    proxies = {
+        "http": proxy_url,
+        "https": proxy_url,
+    }
+
     try:
-        proxies = {
-            "http": proxy_url,
-            "https": proxy_url,
-        }
+
+        start = time.time()
 
         r = requests.get(
-            TEST_URL,
+            TARGET_TEST_URL,
             proxies=proxies,
             timeout=12,
+            allow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36"
+                )
+            },
         )
 
-        if r.ok:
-            ip = r.json().get("origin")
+        elapsed = time.time() - start
 
-            log(f"[proxy] working {proxy_url} -> {ip}")
+        if elapsed > 8:
+            return False
 
-            return True
+        if r.status_code >= 400:
+            return False
+
+        body = r.text.lower()
+
+        if "daraz" not in body:
+            return False
+
+        log(f"[proxy] GOOD {proxy_url} ({elapsed:.1f}s)")
+
+        return True
 
     except Exception:
-        return False
 
-    return False
+        return False
 
 
 def get_working_proxy():
+
+    env_proxy = (
+        os.getenv("MART_PROXY") or ""
+    ).strip()
+
+    # PRIORITY:
+    # explicit proxy from GitHub secrets
+
+    if env_proxy:
+
+        log(f"[proxy] testing MART_PROXY")
+
+        if test_proxy(env_proxy):
+
+            log(f"[proxy] using MART_PROXY")
+
+            return env_proxy
+
+        else:
+
+            log("[proxy] MART_PROXY failed")
+
+    # fallback to free proxy scraping
+
     raw = download_proxy_lists()
 
     if not raw:
-        raise RuntimeError("No proxies downloaded.")
+        return None
 
-    candidates = build_proxy_candidates(raw)
+    random.shuffle(raw)
 
-    log(f"[proxy] testing {len(candidates)} proxies")
+    tested = 0
 
-    for proxy in candidates[:80]:
+    for proxy in raw:
 
-        if test_proxy(proxy):
-            return proxy
+        tested += 1
+
+        if tested > 150:
+            break
+
+        proxy_url = normalize_proxy(proxy)
+
+        log(f"[proxy] testing {proxy_url}")
+
+        if test_proxy(proxy_url):
+
+            return proxy_url
 
     return None
 
 
-def dump_debug(page, label: str):
-    debug_dir = Path("debug")
-    debug_dir.mkdir(exist_ok=True)
-
-    try:
-        page.screenshot(
-            path=str(debug_dir / f"{label}.png"),
-            full_page=True
-        )
-    except Exception:
-        pass
-
-    try:
-        html = page.content()
-
-        (debug_dir / f"{label}.html").write_text(
-            html,
-            encoding="utf-8"
-        )
-
-    except Exception:
-        pass
+# =========================
+# LOGIN
+# =========================
 
 
-def login(page, email, password):
+def login(page, email: str, password: str):
 
-    login_url = "https://sellercenter.daraz.pk/apps/seller/login"
-
-    log(f"[login] opening {login_url}")
+    log(f"[login] opening {LOGIN_URL}")
 
     page.goto(
-        login_url,
+        LOGIN_URL,
         wait_until="domcontentloaded",
-        timeout=120000,
+        timeout=45000,
     )
 
-    page.wait_for_timeout(6000)
+    page.wait_for_timeout(5000)
 
     dump_debug(page, "before_login")
 
-    selectors = [
+    email_selectors = [
         'input[name="account"]',
         'input[type="email"]',
         'input[name="email"]',
@@ -182,11 +314,15 @@ def login(page, email, password):
 
     email_input = None
 
-    for sel in selectors:
+    for sel in email_selectors:
+
         try:
+
             loc = page.locator(sel).first
 
-            loc.wait_for(timeout=4000)
+            loc.wait_for(
+                timeout=4000
+            )
 
             email_input = loc
 
@@ -196,16 +332,22 @@ def login(page, email, password):
             continue
 
     if not email_input:
+
         dump_debug(page, "email_not_found")
-        raise RuntimeError("Email input not found.")
+
+        raise RuntimeError(
+            "Could not locate email field."
+        )
 
     email_input.fill(email)
 
-    pw = page.locator('input[type="password"]').first
+    pw_input = page.locator(
+        'input[type="password"]'
+    ).first
 
-    pw.fill(password)
+    pw_input.fill(password)
 
-    buttons = [
+    submit_selectors = [
         'button[type="submit"]',
         'button:has-text("Login")',
         'button:has-text("Sign In")',
@@ -213,7 +355,7 @@ def login(page, email, password):
 
     clicked = False
 
-    for sel in buttons:
+    for sel in submit_selectors:
 
         btn = page.locator(sel).first
 
@@ -226,39 +368,56 @@ def login(page, email, password):
             break
 
     if not clicked:
-        raise RuntimeError("Login button not found.")
+
+        raise RuntimeError(
+            "Could not find login button."
+        )
 
     try:
+
         page.wait_for_url(
-            re.compile(r"^(?!.*login).*$", re.I),
+            re.compile(
+                r"^(?!.*login).*$",
+                re.I,
+            ),
             timeout=90000,
         )
 
     except Exception:
+
         dump_debug(page, "login_failed")
+
         raise
 
     log("[login] success")
 
 
+# =========================
+# SCRAPE DASHBOARD
+# =========================
+
+
 def collect_metrics(page):
 
-    dashboard_url = "https://sellercenter.daraz.pk/ba/dashboard"
+    log("[dashboard] opening dashboard")
 
     page.goto(
-        dashboard_url,
+        DASHBOARD_URL,
         wait_until="domcontentloaded",
-        timeout=120000,
+        timeout=45000,
     )
 
     page.wait_for_timeout(8000)
 
     dump_debug(page, "dashboard")
 
-    if "login" in page.url.lower():
+    current = page.url.lower()
+
+    if "login" in current:
+
         raise RuntimeError(
-            "Still redirected to login. "
-            "Proxy likely blocked."
+            "Redirected back to login. "
+            "Session invalid or blocked."
         )
 
     cards = page.locator(".D3c3eK")
@@ -272,14 +431,26 @@ def collect_metrics(page):
     for i in range(count):
 
         try:
+
             card = cards.nth(i)
 
-            title = card.locator(".A5EvH0").inner_text().strip()
+            title = (
+                card.locator(".A5EvH0")
+                .inner_text()
+                .strip()
+            )
+
+            value = None
 
             try:
-                value = card.locator(".dlOQtX").inner_text().strip()
+                value = (
+                    card.locator(".dlOQtX")
+                    .inner_text()
+                    .strip()
+                )
+
             except Exception:
-                value = None
+                pass
 
             metrics[title] = value
 
@@ -289,34 +460,50 @@ def collect_metrics(page):
     return metrics
 
 
+# =========================
+# MAIN
+# =========================
+
+
 def main():
 
     email = os.getenv("MART_EMAIL")
+
     password = os.getenv("MART_PASSWORD")
-    cookies_raw = os.getenv("MART_COOKIES", "").strip()
+
+    cookies_raw = (
+        os.getenv("MART_COOKIES") or ""
+    ).strip()
 
     validate_host("sellercenter.daraz.pk")
 
     proxy_url = get_working_proxy()
 
-    if not proxy_url:
-        raise RuntimeError(
-            "No working proxies found."
-        )
+    if proxy_url:
 
-    log(f"[proxy] selected {proxy_url}")
+        log(f"[proxy] selected {proxy_url}")
+
+    else:
+
+        log(
+            "[proxy] no working proxy found "
+            "- using direct connection"
+        )
 
     with sync_playwright() as pw:
 
         browser = pw.chromium.launch(
             headless=True,
-            proxy={
-                "server": proxy_url
-            },
+            proxy=(
+                {"server": proxy_url}
+                if proxy_url
+                else None
+            ),
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
                 "--no-sandbox",
+                "--disable-features=IsolateOrigins,site-per-process",
             ],
         )
 
@@ -325,56 +512,110 @@ def main():
                 "width": 1366,
                 "height": 768,
             },
-            timezone_id="Asia/Karachi",
             locale="en-US",
+            timezone_id="Asia/Karachi",
             user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
                 "Chrome/126.0.0.0 Safari/537.36"
             ),
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         )
 
         page = context.new_page()
 
-        stealth_sync(page)
+        apply_stealth(page)
+
+        # =========================
+        # COOKIES
+        # =========================
 
         if cookies_raw:
 
-            cookies = json.loads(cookies_raw)
+            try:
 
-            context.add_cookies(cookies)
+                cookies = json.loads(
+                    cookies_raw
+                )
 
-            log("[cookies] loaded")
+                context.add_cookies(
+                    cookies
+                )
+
+                log("[cookies] loaded")
+
+            except Exception as e:
+
+                raise RuntimeError(
+                    f"Invalid MART_COOKIES: {e}"
+                )
+
+        # =========================
+        # LOGIN
+        # =========================
 
         else:
 
             if not email or not password:
+
                 raise RuntimeError(
-                    "Provide cookies or credentials."
+                    "Provide MART_COOKIES or credentials."
                 )
 
-            login(page, email, password)
+            login(
+                page,
+                email,
+                password,
+            )
+
+        # =========================
+        # SCRAPE
+        # =========================
 
         metrics = collect_metrics(page)
 
         browser.close()
 
     if not metrics:
-        raise RuntimeError("No metrics scraped.")
 
-    Path("data").mkdir(exist_ok=True)
+        raise RuntimeError(
+            "No metrics scraped."
+        )
 
-    out = {
+    data_dir = (
+        Path(__file__).resolve().parent
+        / "data"
+    )
+
+    data_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    payload = {
         "data_date": yesterday_pkt_str(),
-        "scraped_at": datetime.now(PKT).isoformat(),
+        "scraped_at": datetime.now(
+            PKT
+        ).isoformat(),
         "metric_count": len(metrics),
         "metrics": metrics,
     }
 
-    out_file = Path("data") / f"{yesterday_pkt_str()}.json"
+    out_file = (
+        data_dir
+        / f"{yesterday_pkt_str()}.json"
+    )
 
     out_file.write_text(
-        json.dumps(out, indent=2, ensure_ascii=False),
+        json.dumps(
+            payload,
+            indent=2,
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
 
