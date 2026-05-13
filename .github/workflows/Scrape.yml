@@ -29,12 +29,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Tunnel outbound traffic through Cloudflare WARP so the runner does
-      # not present itself with a known Azure datacenter IP. Free. Some
-      # anti-bot stacks block known datacenter IPs but accept WARP.
-      - name: Route runner through Cloudflare WARP
-        uses: Boostport/setup-cloudflare-warp@v1
-        continue-on-error: true  # if WARP setup fails, still try direct
+      # (Cloudflare WARP step removed -- WARP DNS couldn't resolve the
+      # target host. Re-introduce it later with a DNS override if we still
+      # need to mask the runner IP.)
 
       - name: Show outbound IP (for debugging)
         run: |
